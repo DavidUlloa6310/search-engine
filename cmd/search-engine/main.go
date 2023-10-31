@@ -3,7 +3,7 @@ package main
 import (
 	"log"
 
-	"github.com/DavidUlloa6310/WebCrawler/internal/processdoc"
+	"github.com/DavidUlloa6310/WebCrawler/internal/crawl"
 	"github.com/gocql/gocql"
 )
 
@@ -17,5 +17,5 @@ func main() {
     }
     defer session.Close()
 
-	processdoc.IndexDocument(session, "https://apnews.com/")
+	crawl.IndexDocument(session, "https://apnews.com/")
 }

@@ -1,6 +1,8 @@
-version: '3'
+version: "3"
 services:
   cassandra:
     image: cassandra:latest
     ports:
       - "9042:9042"
+    # volumes:
+    #   - ./internal/cassandra/cassandra.yaml:/etc/cassandra/cassandra.yaml

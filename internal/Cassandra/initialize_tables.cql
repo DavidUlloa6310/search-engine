@@ -1,8 +1,8 @@
-CREATE KEYSPACE IF NOT EXISTS indexing WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': 1};
+CREATE KEYSPACE IF NOT EXISTS tfidf_keyspace WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': 1};
 
-USE indexing;
+USE tfidf_keyspace;
 
-CREATE TABLE indexing.Documents (
+CREATE TABLE IF NOT EXISTS tfidf_keyspace.documents (
     doc_id UUID PRIMARY KEY,
     title TEXT,
     content TEXT,
@@ -12,20 +12,29 @@ CREATE TABLE indexing.Documents (
     total_tokens INT
 );
 
-CREATE INDEX ON Documents (url);
+CREATE INDEX ON tfidf_keyspace.documents (url);
 
-CREATE TABLE indexing.Terms (
-    term TEXT PRIMARY KEY,
-    doc_frequency INT,
-    inv_doc_frequency DOUBLE,
-);
-
-CREATE TABLE indexing.TermFrequencies (
+CREATE TABLE IF NOT EXISTS tfidf_keyspace.term_frequency (
     term TEXT,
     doc_id UUID,
-    term_occurrences INT,
-    tf_idf DOUBLE,
-    doc_frequency INT,
-    total_tokens INT,
+    frequency INT,
     PRIMARY KEY (term, doc_id)
+);
+
+CREATE TABLE IF NOT EXISTS tfidf_keyspace.document_frequency (
+    term TEXT PRIMARY KEY,
+    doc_count COUNTER 
+);
+
+CREATE TABLE IF NOT EXISTS tfidf_keyspace.tfidf_scores (
+    term TEXT,
+    doc_id UUID,
+    tfidf_score DOUBLE,
+    PRIMARY KEY ((term), doc_id)
 ) WITH CLUSTERING ORDER BY (doc_id ASC);
+
+-- CREATE MATERIALIZED VIEW tfidf_keyspace.tfidf_scores_by_score AS
+--     SELECT * FROM tfidf_keyspace.tfidf_scores
+--     WHERE term IS NOT NULL AND doc_id IS NOT NULL AND tfidf_score IS NOT NULL
+--     PRIMARY KEY ((term), tfidf_score, doc_id)
+--     WITH CLUSTERING ORDER BY (tfidf_score DESC, doc_id ASC);

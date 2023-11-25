@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/gocql/gocql"
 	"golang.org/x/net/html"
@@ -24,48 +24,195 @@ type DocumentInfo struct {
 	wordCount *map[string]int
 	totalTokens int
 	lastModified string
-	alreadyStored bool 
 }
 
-func IndexDocument(session *gocql.Session, url string) {
-	var documentInfo DocumentInfo;
-	documentInfo.url = url;
-	docExistsErr := session.Query("SELECT doc_id, last_updated FROM indexing.Documents WHERE url = ? LIMIT 1", url).Scan(&documentInfo.doc_id, &documentInfo.lastModified);
+const MaxBatchSize = 10
 
-	if docExistsErr == nil {
-		// No error finding document; It already exists
-		documentInfo.alreadyStored = true;
-	} else if errors.Is(docExistsErr, gocql.ErrNotFound) {
-		// Error is that document was not found
-		documentInfo.alreadyStored = false
-		documentInfo.lastModified = "";
-		documentInfo.doc_id = gocql.UUIDFromTime(time.Now())
-	} else {
-		// Panic if any other type of error
-		log.Fatal(docExistsErr);
+func IndexDocument(session *gocql.Session, url string) {
+	// var documentInfo DocumentInfo;
+	var documentID gocql.UUID; 
+	var lastModified string;
+	docExistsErr := session.Query("SELECT doc_id, last_updated FROM documents WHERE url = ? LIMIT 1", url).Scan(&documentID, &lastModified);
+
+	if docExistsErr != nil && !errors.Is(docExistsErr, gocql.ErrNotFound) {
+		log.Fatalf("Error retrieving when document was last updated: %s\n", docExistsErr.Error());
 	}
 
-	if documentInfo.alreadyStored {
-		hasUpdated, newDate, checkUpdateError := checkPageUpdate(url, documentInfo.lastModified)
-
-		if checkUpdateError == nil && !hasUpdated {
+	if  hasUpdated, newDate, checkUpdateError := checkPageUpdate(url, lastModified); checkUpdateError == nil {
+		if !hasUpdated {
 			return;
-		} else if checkUpdateError == nil && newDate != "" {
-			documentInfo.lastModified = newDate
+		} else if newDate != "" {
+			lastModified = newDate
 		} 
 	}
 
-	documentInfo.content = collectDocumentContent(url)
-	processDocumentContent(&documentInfo)
-	updateDocumentTable(session, &documentInfo)
+	content := collectDocumentContent(url)
+	var currDoc DocumentInfo
+	currDoc.url = url
+	currDoc.content = content
+	currDoc.lastModified = lastModified
 
-	// totalDocs, totalDocsErr := getDocumentCount(session)
-	// if totalDocsErr != nil {
-	// 	log.Fatal(totalDocsErr)
-	// }
+	if processErr := processDocumentContent(&currDoc); processErr != nil {
+		log.Fatalf("Error processing document content: %s\n", processErr.Error())
+	}
 
-	// updateTermsTable(session, documentInfo.wordCount, documentInfo.totalTokens, totalDocs)
-	// updateTermFrequenciesTable(session, documentInfo.doc_id, documentInfo.wordCount, documentInfo.totalTokens, totalDocs)
+	if updateDocErr := updateDocumentTable(session, currDoc); updateDocErr != nil {
+		log.Fatalf("Error updating documents table: %s\n", updateDocErr.Error())
+	}
+	
+	if updateTermFreqErr := updateTermFrequenciesTable(session, currDoc); updateTermFreqErr != nil {
+		log.Fatalf("Error updating term frequencies: %s\n", updateTermFreqErr.Error())
+	}
+
+	if updateDocFreqErr := updateDocumentFrequencyTable(session, currDoc); updateDocFreqErr != nil {
+		log.Fatalf("Error updating document frequency: %s\n", updateDocFreqErr.Error())
+	}
+
+	if updateTFIDFErr := updateTFIDFTable(session, currDoc); updateTFIDFErr != nil {
+		log.Fatalf("Error updating tf-idf table: %s\n", updateTFIDFErr.Error())
+	}
+
+}
+
+func updateDocumentTable(session *gocql.Session, documentInfo DocumentInfo) error {
+	updateDocsQuery := session.Query(`
+	INSERT INTO documents 
+	(doc_id, title, url, last_updated, content, links, total_tokens) 
+	VALUES (?, ?, ?, ?, ?, ?, ?)`, 
+	documentInfo.doc_id, documentInfo.title, documentInfo.url, documentInfo.lastModified, documentInfo.content, documentInfo.links, documentInfo.totalTokens);
+
+	if updateDocsErr := updateDocsQuery.Exec(); updateDocsErr != nil {
+		return updateDocsErr
+	}
+
+	return nil
+}
+
+
+func updateTermFrequenciesTable(session *gocql.Session, currDoc DocumentInfo) error {
+
+	if currDoc.wordCount == nil {
+		return errors.New("wordCount was not passed into updateTermFrequenciesTable")
+	}
+
+	batch := session.NewBatch(gocql.LoggedBatch)
+	batchSize := 0
+	for term, count := range *currDoc.wordCount {
+		batch.Query(`
+		INSERT INTO term_frequency
+		(term, frequency, doc_id)
+		VALUES (?, ?, ?)
+		`, term, count, currDoc.doc_id)
+		batchSize += 1
+
+		if batchSize >= MaxBatchSize {
+			if err := session.ExecuteBatch(batch); err != nil {
+				return err
+			}
+			batch = session.NewBatch(gocql.LoggedBatch)
+			batchSize = 0
+		}
+	}
+
+	if batchSize > 0 {
+		if err := session.ExecuteBatch(batch); err != nil {
+			return err
+		}
+	}
+
+	return nil;
+}
+
+func updateDocumentFrequencyTable(session *gocql.Session, currDoc DocumentInfo) error {
+	batch := session.NewBatch(gocql.LoggedBatch)
+	batchSize := 0
+	for term := range *currDoc.wordCount {
+
+		batch.Query(`
+		INSERT INTO document_frequency
+		 (term, doc_count)
+		VALUES (?, ?)
+		`, term, 1)
+
+		if batchSize >= MaxBatchSize {
+			if err := session.ExecuteBatch(batch); err != nil {
+				return err
+			}
+			batch = session.NewBatch(gocql.LoggedBatch)
+			batchSize = 0
+		}
+	}
+
+	if batchSize > 0 {
+		if err := session.ExecuteBatch(batch); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func updateTFIDFTable(session *gocql.Session, currDoc DocumentInfo) error {
+
+    totalDocs, docCountErr := getDocumentCount(session)
+    if docCountErr != nil {
+        return docCountErr
+    }
+
+    for term, count := range *currDoc.wordCount {
+        var docFrequency int
+        docFreqErr := session.Query(`
+        SELECT doc_count 
+        FROM document_frequency 
+        WHERE term = ?
+        `, term).Scan(&docFrequency)
+
+        if errors.Is(docFreqErr, gocql.ErrNotFound) {
+            docFrequency = 1
+        } else if docFreqErr != nil {
+            return docFreqErr
+        }
+
+        idf := calcIDF(float64(totalDocs), float64(docFrequency))
+        tf := float64(count) / float64(currDoc.totalTokens)
+
+        if err := session.Query(`
+        DELETE FROM tfidf_scores
+        WHERE term = ? AND doc_id = ? IF EXISTS
+        `, term, currDoc.doc_id).Exec(); err != nil {
+            return err
+        }
+
+        if err := session.Query(`
+        INSERT INTO tfidf_scores (term, doc_id, tfidf_score) 
+        VALUES (?, ?, ?)	
+        `, term, currDoc.doc_id, tf*idf).Exec(); err != nil {
+            return err
+        }
+    }
+
+    return nil
+}
+
+// ================
+// HELPER FUNCTIONS
+// ================
+
+func calcIDF(totalDocs float64 , docFrequency float64) float64 {
+	return 1 + math.Log2(totalDocs / docFrequency)
+}
+
+func collectDocumentContent(url string) *[]byte {
+	res, err := http.Get(url)
+	if err != nil {
+		log.Fatalf("Could not retrieve document %s, error: %v", url, err);
+	}
+	defer res.Body.Close();
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		log.Fatalf("Could not process GET body for url %s, error: %v", url, err);
+	}
+	return &body;
 }
 
 func cleanText(input *string) *string {
@@ -88,7 +235,7 @@ func getDocumentCount(session *gocql.Session) (int, error) {
 	getTotalDocsErr :=session.Query(`
 	SELECT 
 	 COUNT(*)
-	FROM indexing.Documents
+	FROM documents
 	LIMIT 1`).Scan(&totalDocs);
 
 	if getTotalDocsErr != nil {
@@ -125,13 +272,12 @@ func checkPageUpdate(url string, lastModified string) (bool, string, error) {
 	}
 }
 
-func processDocumentContent(documentInfo *DocumentInfo) error {
-	content := *documentInfo.content;
-	if content == nil {
+func processDocumentContent(currDoc *DocumentInfo) error {
+	if currDoc.content == nil {
 		return errors.New("DocumentInfo content is nil, cannot parse information")
 	}
 
-	tkn := html.NewTokenizer(bytes.NewReader(content))
+	tkn := html.NewTokenizer(bytes.NewReader(*currDoc.content))
 
     var links []string
 	
@@ -143,9 +289,9 @@ func processDocumentContent(documentInfo *DocumentInfo) error {
 
         switch {
 		case tt == html.ErrorToken:
-			documentInfo.totalTokens = totalTokens;
-			documentInfo.wordCount = &tokenCount;
-			documentInfo.links = &links;
+			currDoc.totalTokens = totalTokens;
+			currDoc.wordCount = &tokenCount;
+			currDoc.links = &links;
 			return nil
 
 		case tt == html.StartTagToken:
@@ -163,7 +309,7 @@ func processDocumentContent(documentInfo *DocumentInfo) error {
 					textToken := tkn.Token()
 					// Clean the text and assign it to the title field
 					cleanedTitle := cleanText(&textToken.Data)
-					documentInfo.title = *cleanedTitle
+					currDoc.title = *cleanedTitle
 				}
 			}
 
@@ -185,104 +331,4 @@ func processDocumentContent(documentInfo *DocumentInfo) error {
 			}
 		}
 	}
-}
-
-func updateDocumentTable(session *gocql.Session, documentInfo *DocumentInfo) {
-	var updateDocsQuery *gocql.Query; 
-	if (documentInfo.alreadyStored) {
-		updateDocsQuery = session.Query(`
-		UPDATE indexing.Documents SET
-		 title = ?, 
-		 last_updated = ?,
-		 content = ?,
-		 links = ?, 
-		 total_tokens = ? 
-		WHERE doc_id = ?`,
-		documentInfo.title, documentInfo.lastModified, string(*documentInfo.content), documentInfo.links, documentInfo.totalTokens, documentInfo.doc_id);
-	} else {
-		updateDocsQuery = session.Query(`
-		INSERT INTO indexing.Documents 
-		 (doc_id, title, url, last_updated, content, links, total_tokens) 
-		VALUES (?, ?, ?, ?, ?, ?, ?)`, 
-		documentInfo.doc_id, documentInfo.title, documentInfo.url, documentInfo.lastModified, documentInfo.content, documentInfo.links, documentInfo.totalTokens);
-	}
-
-	if updateDocsErr := updateDocsQuery.Exec(); updateDocsErr != nil {
-		log.Fatal(updateDocsErr);
-	}
-}
-
-func updateTermFrequenciesTable(session *gocql.Session, doc_id gocql.UUID, wordCount *map[string]int, totalTokens int, totalDocs int) {
-
-	for term, count := range *wordCount{
-
-		updateDocFreqErr := session.Query(
-			`
-			UPDATE indexing.TermFrequencies SET
-			 doc_frequency = doc_frequency + 1,
-			WHERE term = ? 
-			`, term).Exec()
-
-		if updateDocFreqErr != nil && !errors.Is(updateDocFreqErr, gocql.ErrNotFound) {
-			log.Fatal(updateDocFreqErr);
-		}
-
-		termFrequency := count / totalTokens
-		updateTFErr := session.Query(
-			`
-			UPDATE indexing.TermFrequencies SET
-			 term_occurrences = ?,
-			 total_tokens = ?,
-			 tf_idf = ? * (1 + LOG(? / doc_frequency))
-			WHERE doc_id = ? AND term = ? 
-			`, count, totalTokens, termFrequency, totalDocs, doc_id, term).Exec()
-		
-		if errors.Is(updateTFErr, gocql.ErrNotFound) {
-			insertTFErr := session.Query(`
-			INSERT INTO indexing.TermFrequencies
-			 (term, doc_id, term_occurences, tf_idf, doc_frequency, total_docs, total_tokens)
-			VALUES (?, ?, ?, ?, 1) 
-			`, doc_id, count, termFrequency, 1, totalDocs, totalTokens)
-
-			if insertTFErr != nil {
-				log.Fatal(insertTFErr)
-			}
-		} 
-	}
-}
-
-func updateTermsTable(session *gocql.Session, wordCount *map[string]int, totalTokens int, totalDocs int) {
-
-	for term := range *wordCount {
-
-		updateTermsErr := session.Query(
-		`UPDATE indexing.Terms SET 
-		 doc_frequency = doc_frequency + 1, 
-		 inv_doc_frequency = 1 + LOG(? / (doc_frequency + 1)) 
-		WHERE term = ? 
-		LIMIT 1`, totalDocs, term).Exec()
-
-		if errors.Is(updateTermsErr, gocql.ErrNotFound) {
-			insertTermErr := session.Query(`
-			INSERT INTO 
-			 indexing.Terms (term, doc_frequency, inv_doc_frequency, total_docs) 
-			VALUES (?, 1, 1, ?)`, term, totalDocs).Exec()
-			if insertTermErr != nil {
-				continue;
-			}
-		}
-	}
-}
-
-func collectDocumentContent(url string) *[]byte {
-	res, err := http.Get(url)
-	if err != nil {
-		log.Fatalf("Could not retrieve document %s, error: %v", url, err);
-	}
-	defer res.Body.Close();
-	body, err := io.ReadAll(res.Body)
-	if err != nil {
-		log.Fatalf("Could not process GET body for url %s, error: %v", url, err);
-	}
-	return &body;
 }

@@ -7,5 +7,6 @@ This project implements a simple search engine in Go using TF-IDF and Vector sim
 
 # What's next?
 Next is to...
-* use a local model to create document embeddings to further improve the accuracy of the engine
-* use a graph database like Neo4j to implement ranking algorithms to supplement vector similarity and TF-IDF  
+* use a local LLM model to create document embeddings to further improve the accuracy of the engine
+* use a graph database like Neo4j to implement ranking algorithms to supplement vector similarity and TF-IDF
+* implement a frontend that allows users to make search queries
